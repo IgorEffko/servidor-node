@@ -1,4 +1,3 @@
-
 const express = require("express");
 const mysql = require("mysql2/promise");
 const bcrypt = require("bcryptjs");
@@ -16,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 // ========================================
 
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://127.0.0.1:5500",
+    origin: process.env.FRONTEND_URL || "http://127.0.0.1:5500",
     credentials: true
 }));
 
@@ -72,6 +71,36 @@ function verificarJornalista(req, res, next) {
         return res.status(403).json({
             sucesso: false,
             mensagem: "Apenas jornalistas podem publicar notícias."
+        });
+    }
+
+    next();
+}
+
+// ========================================
+// VERIFICAR PERFIL DE EDITOR
+// ========================================
+
+function verificarEditor(req, res, next) {
+    if (req.session.usuario.perfil !== "editor") {
+        return res.status(403).json({
+            sucesso: false,
+            mensagem: "Apenas editores podem acessar esta função."
+        });
+    }
+
+    next();
+}
+
+// ========================================
+// VERIFICAR PERFIL DE ADMINISTRADOR
+// ========================================
+
+function verificarAdministrador(req, res, next) {
+    if (req.session.usuario.perfil !== "administrador") {
+        return res.status(403).json({
+            sucesso: false,
+            mensagem: "Apenas administradores podem acessar esta função."
         });
     }
 
@@ -272,17 +301,39 @@ app.post("/api/login", async (req, res) => {
             });
         }
 
-        req.session.usuario = {
-            id: usuario.id,
-            nome: usuario.nome,
-            email: usuario.email,
-            perfil: usuario.perfil
-        };
+        req.session.regenerate((erro) => {
+            if (erro) {
+                console.error("Erro ao criar sessão:", erro.message);
 
-        return res.status(200).json({
-            sucesso: true,
-            mensagem: "Login realizado com sucesso!",
-            usuario: req.session.usuario
+                return res.status(500).json({
+                    sucesso: false,
+                    mensagem: "Não foi possível iniciar a sessão."
+                });
+            }
+
+            req.session.usuario = {
+                id: usuario.id,
+                nome: usuario.nome,
+                email: usuario.email,
+                perfil: usuario.perfil
+            };
+
+            req.session.save((erroSalvar) => {
+                if (erroSalvar) {
+                    console.error("Erro ao salvar sessão:", erroSalvar.message);
+
+                    return res.status(500).json({
+                        sucesso: false,
+                        mensagem: "Não foi possível salvar a sessão."
+                    });
+                }
+
+                return res.status(200).json({
+                    sucesso: true,
+                    mensagem: "Login realizado com sucesso!",
+                    usuario: req.session.usuario
+                });
+            });
         });
 
     } catch (erro) {
@@ -396,6 +447,299 @@ app.post(
 );
 
 // ========================================
+// LISTAR NOTÍCIAS PARA REVISÃO
+// ========================================
+
+app.get(
+    "/api/editor/noticias",
+    verificarLogin,
+    verificarEditor,
+    async (req, res) => {
+        try {
+            const [noticias] = await pool.execute(
+                `SELECT
+                    n.id,
+                    n.titulo,
+                    n.categoria,
+                    n.tags,
+                    n.imagem,
+                    n.resumo,
+                    n.conteudo,
+                    n.status,
+                    n.data_criacao,
+                    u.nome AS autor_nome
+                FROM noticias n
+                INNER JOIN usuarios u ON n.autor_id = u.id
+                WHERE n.status = 'EM_REVISAO'
+                ORDER BY n.data_criacao ASC`
+            );
+
+            return res.json({
+                sucesso: true,
+                noticias
+            });
+
+        } catch (erro) {
+            console.error("Erro ao listar notícias:", erro.message);
+
+            return res.status(500).json({
+                sucesso: false,
+                mensagem: "Erro ao carregar notícias para revisão."
+            });
+        }
+    }
+);
+
+// ========================================
+// RESUMO DO PAINEL DO EDITOR
+// ========================================
+
+app.get(
+    "/api/editor/resumo",
+    verificarLogin,
+    verificarEditor,
+    async (req, res) => {
+        try {
+            const [resultado] = await pool.execute(
+                `SELECT
+                    SUM(status = 'EM_REVISAO') AS revisao,
+                    SUM(status = 'APROVADA') AS aprovadas,
+                    SUM(status = 'REJEITADA') AS rejeitadas
+                FROM noticias`
+            );
+
+            const resumo = {
+                revisao: Number(resultado[0].revisao || 0),
+                aprovadas: Number(resultado[0].aprovadas || 0),
+                rejeitadas: Number(resultado[0].rejeitadas || 0)
+            };
+
+            return res.json({
+                sucesso: true,
+                resumo
+            });
+
+        } catch (erro) {
+            console.error("Erro ao carregar resumo:", erro.message);
+
+            return res.status(500).json({
+                sucesso: false,
+                mensagem: "Erro ao carregar os indicadores do editor."
+            });
+        }
+    }
+);
+
+// ========================================
+// APROVAR NOTÍCIA
+// ========================================
+
+app.put(
+    "/api/editor/noticias/:id/aprovar",
+    verificarLogin,
+    verificarEditor,
+    async (req, res) => {
+        try {
+            const id = Number(req.params.id);
+
+            if (!Number.isInteger(id) || id <= 0) {
+                return res.status(400).json({
+                    sucesso: false,
+                    mensagem: "Identificador de notícia inválido."
+                });
+            }
+
+            const [resultado] = await pool.execute(
+                `UPDATE noticias
+                 SET status = 'APROVADA',
+                     justificativa = NULL
+                 WHERE id = ?
+                 AND status = 'EM_REVISAO'`,
+                [id]
+            );
+
+            if (resultado.affectedRows === 0) {
+                return res.status(404).json({
+                    sucesso: false,
+                    mensagem: "Notícia não encontrada ou já analisada."
+                });
+            }
+
+            return res.json({
+                sucesso: true,
+                mensagem: "Notícia aprovada com sucesso!"
+            });
+
+        } catch (erro) {
+            console.error("Erro ao aprovar notícia:", erro.message);
+
+            return res.status(500).json({
+                sucesso: false,
+                mensagem: "Erro ao aprovar notícia."
+            });
+        }
+    }
+);
+
+// ========================================
+// REJEITAR NOTÍCIA
+// ========================================
+
+app.put(
+    "/api/editor/noticias/:id/rejeitar",
+    verificarLogin,
+    verificarEditor,
+    async (req, res) => {
+        try {
+            const id = Number(req.params.id);
+            const { justificativa } = req.body;
+
+            if (!Number.isInteger(id) || id <= 0) {
+                return res.status(400).json({
+                    sucesso: false,
+                    mensagem: "Identificador de notícia inválido."
+                });
+            }
+
+            if (
+                typeof justificativa !== "string" ||
+                !justificativa.trim()
+            ) {
+                return res.status(400).json({
+                    sucesso: false,
+                    mensagem: "Informe o motivo da rejeição."
+                });
+            }
+
+            const [resultado] = await pool.execute(
+                `UPDATE noticias
+                 SET status = 'REJEITADA',
+                     justificativa = ?
+                 WHERE id = ?
+                 AND status = 'EM_REVISAO'`,
+                [justificativa.trim(), id]
+            );
+
+            if (resultado.affectedRows === 0) {
+                return res.status(404).json({
+                    sucesso: false,
+                    mensagem: "Notícia não encontrada ou já analisada."
+                });
+            }
+
+            return res.json({
+                sucesso: true,
+                mensagem: "Notícia rejeitada com sucesso!"
+            });
+
+        } catch (erro) {
+            console.error("Erro ao rejeitar notícia:", erro.message);
+
+            return res.status(500).json({
+                sucesso: false,
+                mensagem: "Erro ao rejeitar notícia."
+            });
+        }
+    }
+);
+
+// ========================================
+// ROTAS DO PAINEL ADMINISTRATIVO
+// ========================================
+
+// RESUMO DO PAINEL
+app.get(
+    "/api/admin/resumo",
+    verificarLogin,
+    verificarAdministrador,
+    async (req, res) => {
+        try {
+            const [resultado] = await pool.execute(
+                `SELECT
+                    (SELECT COUNT(*) FROM usuarios) AS usuarios,
+                    (SELECT COUNT(*) FROM noticias) AS noticias,
+                    (SELECT COUNT(*) FROM noticias WHERE status = 'EM_REVISAO') AS revisao,
+                    (SELECT COUNT(*) FROM noticias WHERE status = 'PUBLICADA') AS publicadas`
+            );
+
+            return res.json({
+                usuarios: Number(resultado[0].usuarios || 0),
+                noticias: Number(resultado[0].noticias || 0),
+                revisao: Number(resultado[0].revisao || 0),
+                publicadas: Number(resultado[0].publicadas || 0)
+            });
+
+        } catch (erro) {
+            console.error("Erro ao carregar resumo administrativo:", erro.message);
+
+            return res.status(500).json({
+                sucesso: false,
+                mensagem: "Erro ao carregar os indicadores do painel."
+            });
+        }
+    }
+);
+
+// LISTAR USUÁRIOS
+app.get(
+    "/api/admin/usuarios",
+    verificarLogin,
+    verificarAdministrador,
+    async (req, res) => {
+        try {
+            const [usuarios] = await pool.execute(
+                `SELECT id, nome, email, perfil, data_cadastro
+                 FROM usuarios
+                 ORDER BY data_cadastro DESC`
+            );
+
+            return res.json(usuarios);
+
+        } catch (erro) {
+            console.error("Erro ao listar usuários:", erro.message);
+
+            return res.status(500).json({
+                sucesso: false,
+                mensagem: "Erro ao carregar os usuários."
+            });
+        }
+    }
+);
+
+// LISTAR NOTÍCIAS
+app.get(
+    "/api/admin/noticias",
+    verificarLogin,
+    verificarAdministrador,
+    async (req, res) => {
+        try {
+            const [noticias] = await pool.execute(
+                `SELECT
+                    n.id,
+                    n.titulo,
+                    n.categoria,
+                    n.status,
+                    n.data_criacao,
+                    u.nome AS autor_nome
+                 FROM noticias n
+                 INNER JOIN usuarios u ON n.autor_id = u.id
+                 ORDER BY n.data_criacao DESC`
+            );
+
+            return res.json(noticias);
+
+        } catch (erro) {
+            console.error("Erro ao listar notícias no painel:", erro.message);
+
+            return res.status(500).json({
+                sucesso: false,
+                mensagem: "Erro ao carregar as notícias."
+            });
+        }
+    }
+);
+
+// ========================================
 // SAIR DA CONTA
 // ========================================
 
@@ -422,5 +766,5 @@ app.post("/api/logout", (req, res) => {
 // ========================================
 
 app.listen(PORT, () => {
-    console.log(`InfoPortal rodando em http://localhost:${PORT}`);
+    console.log(`InfoPortal rodando em http://127.0.0.1:${PORT}`);
 });
